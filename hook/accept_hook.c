@@ -228,7 +228,14 @@ void hook_accept(void)
         "movq $3, %%rax\n\t"            /* SYS_close: child owns the fd now */
         "movq %%r14, %%rdi\n\t"
         "syscall\n\t"
-        "movq $-1, %%r14\n\t"
+        /* re-enter real accept with the original arguments so the next
+         * connection surfaces at this call site rather than returning -1 */
+        "movq 0(%%r15), %%rax\n\t"
+        "movq %%rbx, %%rdi\n\t"
+        "movq %%r12, %%rsi\n\t"
+        "movq %%r13, %%rdx\n\t"
+        "call *%%rax\n\t"
+        "movq %%rax, %%r14\n\t"
         "jmp .Lreturn_fd\n\t"
 
         ".Lrestore_return_fd:\n\t"
@@ -484,7 +491,14 @@ void hook_accept(void)
         "mov r7, #6\n\t"                /* NR_close: child owns the fd */
         "mov r0, r9\n\t"
         "svc #0\n\t"
-        "mvn r9, #0\n\t"               /* r9 = -1 */
+        /* re-enter real accept using original sockfd/addr/addrlen saved on
+         * the stack by the entry push — after add sp,#2048 they are at sp+0/4/8 */
+        "ldr r0, [sp, #0]\n\t"         /* original sockfd (saved r4) */
+        "ldr r1, [sp, #4]\n\t"         /* original addr   (saved r5) */
+        "ldr r2, [sp, #8]\n\t"         /* original addrlen (saved r6) */
+        "ldr r3, [r10, #0]\n\t"        /* config->real_accept */
+        "blx r3\n\t"
+        "mov r9, r0\n\t"
         "b .Larm_return_fd\n\t"
 
         ".Larm_restore_return_fd:\n\t"
