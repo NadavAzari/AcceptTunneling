@@ -5,10 +5,14 @@
 #   make CROSS_COMPILE=mipsel-linux-gnu-       # MIPS little-endian
 CROSS_COMPILE ?=
 
-CC     = $(CROSS_COMPILE)gcc
-CFLAGS = -Wall -Wextra -Iinclude
+CC          = $(CROSS_COMPILE)gcc
+CFLAGS      = -Wall -Wextra -Iinclude $(EXTRA_CFLAGS)
+LDFLAGS    ?=
 
-TARGET      = portstealer
+# Override BUILDDIR and BIN for out-of-tree builds (used by the dist target).
+BUILDDIR   ?= .
+BIN        ?= portstealer
+
 TEST_SERVER = test/server
 
 SRCS = main.c             \
@@ -21,27 +25,49 @@ SRCS = main.c             \
        inject/hook.c      \
        hook/accept_hook.c
 
-OBJS = $(SRCS:.c=.o)
-
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
-
-$(TEST_SERVER): test/server.c
-	$(CC) $(CFLAGS) -o $@ $<
+OBJS = $(addprefix $(BUILDDIR)/,$(SRCS:.c=.o))
 
 # hook/accept_hook.c contains naked functions — disable stack protector.
 # On ARM targets, force ARM (not Thumb) mode so conditional data-processing
 # instructions and register-shifted-register operands assemble correctly.
-HOOK_ARCH_FLAGS := $(shell $(CC) -dumpmachine | grep -q arm && echo -marm)
-hook/accept_hook.o: hook/accept_hook.c
+HOOK_ARCH_FLAGS := $(shell $(CC) -dumpmachine 2>/dev/null | grep -q arm && echo -marm)
+
+# 'build' is the default goal for recursive dist invocations.
+build: $(BIN)
+
+$(BIN): $(OBJS)
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(TEST_SERVER): test/server.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+all: $(BIN) $(TEST_SERVER)
+
+$(BUILDDIR)/hook/accept_hook.o: hook/accept_hook.c
+	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fno-stack-protector $(HOOK_ARCH_FLAGS) -c -o $@ $<
 
-%.o: %.c
+$(BUILDDIR)/%.o: %.c
+	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-all: $(TARGET) $(TEST_SERVER)
+# ── dist: build all static targets ───────────────────────────────────────────
+# Output: dist/portstealer-arm   (ARMv7 hard-float, NVR302-32S kernel 3.18.x)
+#         dist/portstealer-x64   (x86-64, statically linked)
+#
+# Note: x86-32 is omitted — hook/accept_hook.c has no __i386__ implementation.
+
+dist:
+	$(MAKE) build BIN=dist/portstealer-arm BUILDDIR=build/arm \
+	        CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
+	$(MAKE) build BIN=dist/portstealer-x64 BUILDDIR=build/x64 \
+	        LDFLAGS=-static
+	@echo ""
+	@file dist/portstealer-arm dist/portstealer-x64
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_SERVER)
+	rm -rf build dist
+	rm -f $(OBJS) portstealer $(TEST_SERVER)
 
-.PHONY: all clean
+.PHONY: all build dist clean

@@ -1,3 +1,5 @@
 .claude/
 test/
-.o
+*.o
+build/
+dist/

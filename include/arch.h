@@ -183,4 +183,13 @@ typedef Elf64_Rel   arch_rel_t;
 #error "Unsupported architecture — add an #elif block in include/arch.h"
 #endif
 
+/* Program header and dynamic entry types — derived from word size, not arch */
+#if ARCH_ELF_CLASS == ELFCLASS32
+typedef Elf32_Phdr  arch_phdr_t;
+typedef Elf32_Dyn   arch_dyn_t;
+#else
+typedef Elf64_Phdr  arch_phdr_t;
+typedef Elf64_Dyn   arch_dyn_t;
+#endif
+
 #endif /* ARCH_H */
