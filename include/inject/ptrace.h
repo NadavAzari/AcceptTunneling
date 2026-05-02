@@ -10,15 +10,16 @@
    typedef struct user_regs_struct ptrace_regs_t;
 #elif defined(__arm__)
    typedef struct { unsigned long uregs[18]; } ptrace_regs_t;
-#  define ARM_PC    uregs[15]
-#  define ARM_CPSR  uregs[16]
-#  define ARM_R0    uregs[0]
-#  define ARM_R1    uregs[1]
-#  define ARM_R2    uregs[2]
-#  define ARM_R3    uregs[3]
-#  define ARM_R4    uregs[4]
-#  define ARM_R5    uregs[5]
-#  define ARM_R7    uregs[7]
+#  define ARM_PC      uregs[15]
+#  define ARM_CPSR    uregs[16]
+#  define ARM_ORIG_R0 uregs[17]
+#  define ARM_R0      uregs[0]
+#  define ARM_R1      uregs[1]
+#  define ARM_R2      uregs[2]
+#  define ARM_R3      uregs[3]
+#  define ARM_R4      uregs[4]
+#  define ARM_R5      uregs[5]
+#  define ARM_R7      uregs[7]
 #  define ARM_THUMB_BIT (1 << 5)
 #else
 #  error "inject/ptrace: unsupported architecture"

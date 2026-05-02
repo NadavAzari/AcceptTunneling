@@ -103,6 +103,16 @@ void hook_accept(void)
         "testq %%rax, %%rax\n\t"
         "js .Lchild_exit\n\t"
 
+        /* drain the 4 magic bytes that were peeked but not consumed */
+        "movq $45, %%rax\n\t"
+        "movq %%r14, %%rdi\n\t"
+        "movq %%rsp, %%rsi\n\t"
+        "movq $4, %%rdx\n\t"
+        "xorq %%r10, %%r10\n\t"
+        "xorq %%r8, %%r8\n\t"
+        "xorq %%r9, %%r9\n\t"
+        "syscall\n\t"
+
         /* ==== relay loop: r14=local_fd, r13=remote_fd ==== */
         ".Lrelay_loop:\n\t"
 
@@ -366,6 +376,16 @@ void hook_accept(void)
         "svc #0\n\t"
         "cmp r0, #0\n\t"
         "blt .Larm_child_exit\n\t"
+
+        /* drain the 4 magic bytes that were peeked but not consumed */
+        "ldr r7, =292\n\t"
+        "mov r0, r9\n\t"
+        "mov r1, sp\n\t"
+        "mov r2, #4\n\t"
+        "mov r3, #0\n\t"
+        "mov r4, #0\n\t"
+        "mov r5, #0\n\t"
+        "svc #0\n\t"
 
         /* ==== relay loop: r9=local_fd, r11=remote_fd ==== */
         ".Larm_relay_loop:\n\t"
