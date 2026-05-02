@@ -38,15 +38,16 @@ First thing is the injector. we need to inject our payload somehow, so i asked f
 - use ptrace to read the GOT address and have the real address of `accept`
 - Injecting a `syscall` by overriding `EIP / PC` and calling `mmap` to allocate buffer and get the address of it
 - Putting our payload in the returned buffer
+- After the payload put our `config struct` which holds the remote ip and remote port for the shellcode
 - Overriding the `GOT` address of accept to our new payload!
 
-After coding the injection method, we need a payload.
-Claude is the real deal, and he coded the payload i asked for in **assembly**
+After coding the injection method, we need a payload which needs to be a shellcode.
+Claude is the real deal, and he coded the shellcode i asked for in **assembly**
 We need something that reads 4 bytes from the socket, if its 
 ```
 \xde\xad\xbe\xef
 ```
-We are using `select()` to tunnel our self to the destination.
+We are using `select()` to tunnel our self to the destination which is stored after the shellcode in the config struct.
 If not, we are just returning the `fd` to our caller.
 
 
