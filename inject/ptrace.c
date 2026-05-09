@@ -302,18 +302,6 @@ long ptrace_inject_syscall(pid_t pid, long nr,
     uint8_t orig[8];   /* large enough for any arch's sequence */
     ptrace_read_mem(pid, pc, orig, instr_len);
     ptrace_write_mem(pid, pc, instr, instr_len);
-#if defined(__arm__)
-    {
-        uint8_t verify[4] = {0};
-        ptrace_read_mem(pid, pc, verify, instr_len);
-        fprintf(stderr, "[dbg] wrote at 0x%lx: %02x%02x%02x%02x  want: %02x%02x%02x%02x\n",
-                (unsigned long)pc,
-                verify[0], verify[1], verify[2], verify[3],
-                instr[0], instr[1],
-                instr_len > 2 ? instr[2] : 0,
-                instr_len > 3 ? instr[3] : 0);
-    }
-#endif
 
     /* Set up registers for the syscall. */
     memcpy(&modified, &saved, sizeof(saved));
@@ -343,10 +331,6 @@ long ptrace_inject_syscall(pid_t pid, long nr,
             restore_regs(pid, &saved);
             return -1;
         }
-        fprintf(stderr, "[dbg] waitpid status=0x%x WIFSTOPPED=%d WSTOPSIG=%d WIFEXITED=%d WIFSIGNALED=%d\n",
-                status, WIFSTOPPED(status),
-                WIFSTOPPED(status) ? WSTOPSIG(status) : -1,
-                WIFEXITED(status), WIFSIGNALED(status));
         if (!WIFSTOPPED(status)) {
             fprintf(stderr, "ptrace_inject_syscall: tracee terminated (status 0x%x)\n",
                     status);
@@ -367,10 +351,6 @@ long ptrace_inject_syscall(pid_t pid, long nr,
         return -1;
     }
     long result = regs_result(&after);
-#if defined(__arm__)
-    fprintf(stderr, "[dbg] after SIGTRAP: PC=0x%lx R0=0x%lx result=%ld\n",
-            (unsigned long)after.ARM_PC, (unsigned long)after.ARM_R0, result);
-#endif
 
     /* Restore original bytes and registers. */
     ptrace_write_mem(pid, pc, orig, instr_len);

@@ -26,7 +26,7 @@ import socket
 import select
 import threading
 
-MAGIC = b'\xde\xad\xbe\xef'
+MAGIC = b'\xbc\xbc\x05\x00\xde\xad\xbe\xef'
 BUF   = 4096
 
 
