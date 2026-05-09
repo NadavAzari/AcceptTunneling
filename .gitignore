@@ -3,3 +3,6 @@ test/
 *.o
 build/
 dist/
+portstealer
+client.py
+index.html
